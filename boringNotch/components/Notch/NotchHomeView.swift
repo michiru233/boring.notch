@@ -120,7 +120,7 @@ struct MusicControlsView: View {
     @Default(.musicControlSlotLimit) private var slotLimit
 
     var body: some View {
-        VStack(alignment: .leading) {
+        VStack(alignment: .leading, spacing: 2) {
             songInfoAndSlider
             slotToolbar
         }
@@ -131,11 +131,11 @@ struct MusicControlsView: View {
         GeometryReader { geo in
             // Lyrics take the right half of the player. The title/artist block
             // keeps the rest and shrinks gracefully, since it scrolls.
-            let lyricsWidth = min(330, max(160, geo.size.width * 0.55))
+            let lyricsWidth = min(340, max(190, geo.size.width * 0.58))
             let infoWidth = max(
                 0, geo.size.width - (Defaults[.enableLyrics] ? lyricsWidth + 12 : 0))
 
-            VStack(alignment: .leading, spacing: 4) {
+            VStack(alignment: .leading, spacing: 2) {
                 HStack(alignment: .top, spacing: 12) {
                     songInfo(width: infoWidth)
                         .frame(width: infoWidth, alignment: .leading)
@@ -148,7 +148,9 @@ struct MusicControlsView: View {
                 musicSlider
             }
         }
-        .padding(.top, 10)
+        // The notch occupies the top ~35pt of the window; 4pt of clearance is
+        // enough, and the 6pt the old 10pt inset wasted now goes to the lyrics.
+        .padding(.top, 4)
         .padding(.leading, 5)
     }
 
@@ -186,8 +188,10 @@ struct MusicControlsView: View {
             ) { newValue in
                 MusicManager.shared.seek(to: newValue)
             }
-            .padding(.top, 5)
-            .frame(height: 36)
+            .padding(.top, 2)
+            // The slider bar and its time labels need ~24pt; the rest was dead
+            // space that the lyrics panel can use instead.
+            .frame(height: 27)
         }
     }
 
@@ -279,91 +283,182 @@ struct MusicControlsView: View {
     }
 }
 
-/// Lyrics for the right half of the player: the previous line, the current line
-/// with its translation, then the next line.
+/// Synced lyrics for the right half of the player.
 ///
-/// The panel keeps a fixed height so the progress bar and control row below it
-/// never shift between tracks. When only unsynced lyrics are available there is
-/// no timeline to follow, so the text is shown as a static block instead.
-struct LyricsPanel: View {
-    @ObservedObject var musicManager = MusicManager.shared
+/// The lines travel upward continuously rather than stepping once per line, and
+/// the line being sung sits in the second row — bright white and bold, with its
+/// neighbours fading the further they are from it. When the track has a
+/// translation it appears in a strip pinned to the bottom, so it stays put while
+/// the lyrics above it scroll past.
+///
+/// The panel takes whatever height the player leaves over and works out how many
+/// lines fit, because that budget is not knowable from here: the notch is 190pt
+/// tall, the control row and progress bar are fixed, and what remains for lyrics
+/// lands around 67pt.
+///
+/// This view is pure: it renders exactly the frame it is handed. `LyricsPanel`
+/// below is the piece that reads the player and feeds it.
+struct LyricsView: View {
+    let lines: [LyricLine]
+    let index: Int
+    let progress: Double
+    let placeholder: String?
 
-    private static let previousSize: CGFloat = 11
-    private static let currentSize: CGFloat = 13
-    private static let translationSize: CGFloat = 10
-    private static let nextSize: CGFloat = 11
+    private static let rowHeight: CGFloat = 15
+    /// Where the sung line's top edge sits: one row down, so exactly one line of
+    /// history stays visible above it.
+    private static let anchorTop: CGFloat = rowHeight
+    /// Reserved at the bottom for the translation of the sung line — but only
+    /// when the track has translations at all, since most Chinese tracks do not
+    /// and the space is better spent on another lyric line.
+    private static let translationSlot: CGFloat = 21
 
-    private static let panelHeight: CGFloat = 65
-    private static let previousHeight: CGFloat = 15
-    private static let currentHeight: CGFloat = 18
-    private static let translationHeight: CGFloat = 14
-    private static let nextHeight: CGFloat = 15
+    private static let currentSize: CGFloat = 12.5
+    private static let otherSize: CGFloat = 11
+    private static let translationSize: CGFloat = 9.5
 
     var body: some View {
-        TimelineView(.animation(minimumInterval: 0.25)) { timeline in
-            panel(elapsed: elapsed(at: timeline.date))
-                .frame(height: Self.panelHeight, alignment: .topLeading)
-        }
-    }
+        GeometryReader { geo in
+            let reserved = Self.hasTranslation(lines) ? Self.translationSlot : 0
+            let rows = Self.rowCount(for: geo.size.height - reserved)
+            let lyricsHeight = CGFloat(rows) * Self.rowHeight
 
-    @ViewBuilder
-    private func panel(elapsed: Double) -> some View {
-        if let window = musicManager.lyricWindow(at: elapsed) {
-            VStack(alignment: .leading, spacing: 1) {
-                slot(
-                    window.previous, size: Self.previousSize, height: Self.previousHeight,
-                    color: .white.opacity(0.35))
-                slot(
-                    window.current, size: Self.currentSize, height: Self.currentHeight,
-                    color: .white, weight: .semibold)
-                slot(
-                    window.translation, size: Self.translationSize,
-                    height: Self.translationHeight, color: .gray)
-                slot(
-                    window.next, size: Self.nextSize, height: Self.nextHeight,
-                    color: .white.opacity(0.35))
+            Group {
+                if let placeholder {
+                    Text(placeholder)
+                        .font(.system(size: Self.otherSize))
+                        .foregroundStyle(.white.opacity(0.35))
+                        .lineLimit(4)
+                        .multilineTextAlignment(.leading)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .frame(maxWidth: .infinity, alignment: .topLeading)
+                } else {
+                    VStack(alignment: .leading, spacing: 0) {
+                        scrollingLines(rows: rows)
+                            .frame(height: lyricsHeight, alignment: .top)
+                            // Lines enter and leave through a soft fade rather
+                            // than a hard cut, which is what a half-scrolled
+                            // line needs to not look like a rendering glitch.
+                            .mask(Self.edgeFade)
+                        if reserved > 0 {
+                            translationLine
+                                .frame(
+                                    height: max(0, geo.size.height - lyricsHeight),
+                                    alignment: .top)
+                        }
+                    }
+                }
             }
-        } else {
-            Text(placeholderText)
-                .font(.system(size: Self.previousSize))
-                .foregroundStyle(.white.opacity(0.35))
-                .lineLimit(4)
-                .multilineTextAlignment(.leading)
-                .fixedSize(horizontal: false, vertical: true)
-                .frame(maxWidth: .infinity, alignment: .topLeading)
         }
     }
 
-    /// Empty slots still reserve their height so the panel does not resize when
-    /// a track has no translation or no neighbouring line.
-    private func slot(
-        _ text: String?, size: CGFloat, height: CGFloat, color: Color,
-        weight: Font.Weight = .regular
-    ) -> some View {
-        Text(text ?? " ")
-            .font(.system(size: size, weight: weight))
-            .foregroundStyle(color)
+    /// How many lyric lines fit in whatever height the player leaves over. The
+    /// count is derived rather than fixed — at least two rows, so the scroll
+    /// always has somewhere to go.
+    private static func rowCount(for height: CGFloat) -> Int {
+        max(2, Int((height / rowHeight).rounded(.down)))
+    }
+
+    private static var edgeFade: LinearGradient {
+        LinearGradient(
+            stops: [
+                .init(color: .clear, location: 0),
+                .init(color: .black, location: 0.07),
+                .init(color: .black, location: 0.93),
+                .init(color: .clear, location: 1),
+            ],
+            startPoint: .top,
+            endPoint: .bottom)
+    }
+
+    private static func hasTranslation(_ lines: [LyricLine]) -> Bool {
+        lines.contains { !($0.translation ?? "").trimmingCharacters(in: .whitespaces).isEmpty }
+    }
+
+    private func scrollingLines(rows: Int) -> some View {
+        let first = index - 1
+        // Over one line's duration the stack rises by exactly one row, which
+        // lands the next line precisely where the sung one started.
+        let offset =
+            Self.anchorTop - CGFloat(index - first) * Self.rowHeight
+            - progress * Self.rowHeight
+
+        return VStack(alignment: .leading, spacing: 0) {
+            ForEach(0..<(rows + 2), id: \.self) { slot in
+                row(at: first + slot)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .offset(y: offset)
+    }
+
+    private func row(at line: Int) -> some View {
+        // Out-of-range slots still occupy their height, otherwise the rows below
+        // them would jump as the window reaches the ends of the song.
+        let text = lines.indices.contains(line) ? lines[line].text : ""
+        let distance = abs(line - index)
+
+        return Text(text.isEmpty ? " " : text)
+            .font(
+                .system(
+                    size: distance == 0 ? Self.currentSize : Self.otherSize,
+                    weight: distance == 0 ? .semibold : .regular)
+            )
+            .foregroundStyle(.white.opacity(Self.opacity(at: distance)))
             .lineLimit(1)
             .truncationMode(.tail)
             .frame(maxWidth: .infinity, alignment: .leading)
-            .frame(height: height)
+            .frame(height: Self.rowHeight)
+    }
+
+    /// The sung line stays fully bright; everything else fades with distance.
+    private static func opacity(at distance: Int) -> Double {
+        switch distance {
+        case 0: return 1
+        case 1: return 0.5
+        case 2: return 0.32
+        default: return 0.2
+        }
+    }
+
+    private var translationLine: some View {
+        let translation =
+            lines.indices.contains(index)
+            ? lines[index].translation?.trimmingCharacters(in: .whitespacesAndNewlines) : nil
+        let text = (translation?.isEmpty ?? true) ? nil : translation
+
+        return Text(text ?? " ")
+            .font(.system(size: Self.translationSize))
+            .foregroundStyle(.white.opacity(0.55))
+            .lineLimit(1)
+            .truncationMode(.tail)
+            .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
+/// Feeds `LyricsView` from the player. While the position is interpolated from
+/// the last now-playing update the redraw is what keeps the scroll smooth.
+struct LyricsPanel: View {
+    @ObservedObject var musicManager = MusicManager.shared
+
+    var body: some View {
+        TimelineView(.animation(minimumInterval: musicManager.isPlaying ? 0.05 : 1)) {
+            timeline in
+            let frame = musicManager.lyricFrame(at: timeline.date)
+
+            LyricsView(
+                lines: musicManager.syncedLyrics,
+                index: frame?.index ?? 0,
+                progress: frame?.progress ?? 0,
+                placeholder: frame == nil ? placeholderText : nil
+            )
+        }
     }
 
     private var placeholderText: String {
         if musicManager.isFetchingLyrics { return "Loading lyrics…" }
         let lyrics = musicManager.currentLyrics.trimmingCharacters(in: .whitespacesAndNewlines)
         return lyrics.isEmpty ? "No lyrics found" : lyrics
-    }
-
-    /// Playback position interpolated from the last now-playing update, so the
-    /// highlighted line advances smoothly between the player's own refreshes.
-    private func elapsed(at date: Date) -> Double {
-        guard musicManager.isPlaying else { return musicManager.elapsedTime }
-
-        let delta = date.timeIntervalSince(musicManager.timestampDate)
-        let progressed = musicManager.elapsedTime + (delta * musicManager.playbackRate)
-        guard musicManager.songDuration > 0 else { return max(0, progressed) }
-        return min(max(progressed, 0), musicManager.songDuration)
     }
 }
 

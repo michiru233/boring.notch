@@ -507,24 +507,28 @@ class MusicManager: ObservableObject {
         LRCParser.parse(lrc)
     }
 
-    /// The line to show for a playback position, plus its neighbours, so the
-    /// player can render a scrolling window instead of a single line.
-    struct LyricWindow: Equatable {
-        var previous: String?
-        var current: String
-        var translation: String?
-        var next: String?
+    /// Everything the scrolling panel needs for one frame: which line is being
+    /// sung, and how far through that line we are. The fraction is what makes
+    /// the lyrics glide instead of stepping once per line.
+    struct LyricFrame: Equatable {
+        var index: Int
+        var progress: Double
     }
 
-    func lyricWindow(at elapsed: Double) -> LyricWindow? {
+    func lyricFrame(at date: Date = Date()) -> LyricFrame? {
         guard !syncedLyrics.isEmpty else { return nil }
+        let elapsed = estimatedPlaybackPosition(at: date)
         let index = indexOfLine(at: elapsed)
-        return LyricWindow(
-            previous: index > 0 ? syncedLyrics[index - 1].text : nil,
-            current: syncedLyrics[index].text,
-            translation: syncedLyrics[index].translation,
-            next: index + 1 < syncedLyrics.count ? syncedLyrics[index + 1].text : nil
-        )
+        let start = syncedLyrics[index].time
+        let end =
+            index + 1 < syncedLyrics.count
+            ? syncedLyrics[index + 1].time
+            : max(start, songDuration)
+        let span = end - start
+        // Timestamps this close together would make the fraction jump around,
+        // so treat the line as a single instant and hold the stack still.
+        let progress = span > 0.05 ? min(max((elapsed - start) / span, 0), 1) : 0
+        return LyricFrame(index: index, progress: progress)
     }
 
     /// Index of the last line whose timestamp is at or before `elapsed`.
@@ -542,11 +546,6 @@ class MusicManager: ObservableObject {
             }
         }
         return index
-    }
-
-    func lyricLine(at elapsed: Double) -> String {
-        guard !syncedLyrics.isEmpty else { return currentLyrics }
-        return syncedLyrics[indexOfLine(at: elapsed)].text
     }
 
     private func triggerFlipAnimation() {
