@@ -59,6 +59,38 @@ enum SneakPeekStyle: String, CaseIterable, Identifiable, Defaults.Serializable {
     var id: String { self.rawValue }
 }
 
+// How the lyrics are laid out in the player.
+//
+// The notch only leaves the lyric panel about 67pt of height, which is not enough
+// to scroll readable text in. "Two lines" spends that height on two large rows —
+// the line being sung and the one after it — and swaps them whole as the song
+// moves on. "Scrolling" keeps the denser marquee for people who prefer seeing the
+// lyrics coming.
+enum LyricsDisplayMode: String, CaseIterable, Identifiable, Defaults.Serializable {
+    case twoLine = "Two lines"
+    case scroll = "Scrolling"
+
+    var id: String { self.rawValue }
+}
+
+// Which text the lyrics carry when the track has a translation on NetEase.
+enum LyricsLanguage: String, CaseIterable, Identifiable, Defaults.Serializable {
+    case original = "Original"
+    case translation = "Translation"
+    case automatic = "Automatic"
+
+    var id: String { self.rawValue }
+
+    /// Order the lyrics area cycles through when it is clicked.
+    var next: LyricsLanguage {
+        switch self {
+        case .original: return .translation
+        case .translation: return .automatic
+        case .automatic: return .original
+        }
+    }
+}
+
 // Action to perform when Option (⌥) is held while pressing media keys
 enum OptionKeyAction: String, CaseIterable, Identifiable, Defaults.Serializable {
     case openSettings = "Open System Settings"
@@ -129,6 +161,8 @@ extension Defaults.Keys {
     static let waitInterval = Key<Double>("waitInterval", default: 3)
     static let showShuffleAndRepeat = Key<Bool>("showShuffleAndRepeat", default: false)
     static let enableLyrics = Key<Bool>("enableLyrics", default: false)
+    static let lyricsDisplayMode = Key<LyricsDisplayMode>("lyricsDisplayMode", default: .twoLine)
+    static let lyricsLanguage = Key<LyricsLanguage>("lyricsLanguage", default: .original)
     static let musicControlSlots = Key<[MusicControlButton]>(
         "musicControlSlots",
         default: MusicControlButton.defaultLayout

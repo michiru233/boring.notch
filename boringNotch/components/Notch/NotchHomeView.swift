@@ -118,6 +118,7 @@ struct MusicControlsView: View {
     @State private var lastDragged: Date = .distantPast
     @Default(.musicControlSlots) private var slotConfig
     @Default(.musicControlSlotLimit) private var slotLimit
+    @Default(.lyricsDisplayMode) private var lyricsDisplayMode
 
     var body: some View {
         VStack(alignment: .leading, spacing: 2) {
@@ -131,7 +132,13 @@ struct MusicControlsView: View {
         GeometryReader { geo in
             // Lyrics take the right half of the player. The title/artist block
             // keeps the rest and shrinks gracefully, since it scrolls.
-            let lyricsWidth = min(340, max(190, geo.size.width * 0.58))
+            //
+            // The two-line layout has rows to spare and spends them on a wider
+            // column instead, because a 21pt line needs the room to stay whole.
+            let twoLine = lyricsDisplayMode == .twoLine
+            let lyricsWidth = min(
+                twoLine ? 380 : 340,
+                max(190, geo.size.width * (twoLine ? 0.72 : 0.58)))
             let infoWidth = max(
                 0, geo.size.width - (Defaults[.enableLyrics] ? lyricsWidth + 12 : 0))
 
@@ -283,26 +290,35 @@ struct MusicControlsView: View {
     }
 }
 
-/// Synced lyrics for the right half of the player.
+/// Synced lyrics for the right half of the player, in one of two layouts.
 ///
-/// The lines travel upward continuously rather than stepping once per line, and
-/// the line being sung sits in the second row — bright white and bold, with its
-/// neighbours fading the further they are from it. When the track has a
-/// translation it appears in a strip pinned to the bottom, so it stays put while
-/// the lyrics above it scroll past.
+/// `twoLine` gives the panel over to two large rows — the line being sung, bright
+/// white and semibold, above the one that follows it, dimmed — and replaces both
+/// whole as the song moves on. Trading the extra rows for type size is the whole
+/// point: at 21pt a line is legible at a glance, where the dense scrolling layout
+/// had to make do with 12.5pt.
 ///
-/// The panel takes whatever height the player leaves over and works out how many
-/// lines fit, because that budget is not knowable from here: the notch is 190pt
-/// tall, the control row and progress bar are fixed, and what remains for lyrics
-/// lands around 67pt.
+/// `scroll` is the denser marquee. Lines travel upward continuously rather than
+/// stepping once per line, the sung line sits in the second row, its neighbours
+/// fade with distance, and a translation appears in a strip pinned to the bottom
+/// so it stays put while the lyrics above it scroll past.
 ///
-/// This view is pure: it renders exactly the frame it is handed. `LyricsPanel`
-/// below is the piece that reads the player and feeds it.
+/// The panel takes whatever height the player leaves over and works out how much
+/// fits, because that budget is not knowable from here: the notch is 190pt tall,
+/// the control row and progress bar are fixed, and what remains for lyrics lands
+/// around 67pt.
+///
+/// This view is pure: it renders exactly the frame it is handed, with `lines`
+/// already resolved to whichever language is being shown. `LyricsPanel` below is
+/// the piece that reads the player and feeds it.
 struct LyricsView: View {
     let lines: [LyricLine]
+    let mode: LyricsDisplayMode
     let index: Int
     let progress: Double
     let placeholder: String?
+
+    // MARK: Scrolling layout
 
     private static let rowHeight: CGFloat = 15
     /// Where the sung line's top edge sits: one row down, so exactly one line of
@@ -317,37 +333,96 @@ struct LyricsView: View {
     private static let otherSize: CGFloat = 11
     private static let translationSize: CGFloat = 9.5
 
+    // MARK: Two-line layout
+
+    /// The sung line carries the panel; the next one is a dimmed preview.
+    private static let sungSize: CGFloat = 21
+    private static let nextSize: CGFloat = 14
+    /// How far the sung line may shrink before it is allowed to truncate. Short
+    /// lines keep the full 21pt; a long Japanese line gives ground down to 15pt
+    /// rather than losing its ending.
+    private static let sungShrink: CGFloat = 15.0 / 21.0
+    private static let nextShrink: CGFloat = 0.78
+    /// The replacement is a cross-fade: a slide would read as the scrolling
+    /// layout this mode exists to replace.
+    private static let jumpDuration: Double = 0.25
+
     var body: some View {
         GeometryReader { geo in
-            let reserved = Self.hasTranslation(lines) ? Self.translationSlot : 0
-            let rows = Self.rowCount(for: geo.size.height - reserved)
-            let lyricsHeight = CGFloat(rows) * Self.rowHeight
-
             Group {
                 if let placeholder {
-                    Text(placeholder)
-                        .font(.system(size: Self.otherSize))
-                        .foregroundStyle(.white.opacity(0.35))
-                        .lineLimit(4)
-                        .multilineTextAlignment(.leading)
-                        .fixedSize(horizontal: false, vertical: true)
-                        .frame(maxWidth: .infinity, alignment: .topLeading)
+                    placeholderView(placeholder)
+                } else if mode == .twoLine {
+                    twoLineLines
                 } else {
-                    VStack(alignment: .leading, spacing: 0) {
-                        scrollingLines(rows: rows)
-                            .frame(height: lyricsHeight, alignment: .top)
-                            // Lines enter and leave through a soft fade rather
-                            // than a hard cut, which is what a half-scrolled
-                            // line needs to not look like a rendering glitch.
-                            .mask(Self.edgeFade)
-                        if reserved > 0 {
-                            translationLine
-                                .frame(
-                                    height: max(0, geo.size.height - lyricsHeight),
-                                    alignment: .top)
-                        }
-                    }
+                    scrollingLines(height: geo.size.height)
                 }
+            }
+        }
+    }
+
+    private func placeholderView(_ text: String) -> some View {
+        Text(text)
+            .font(.system(size: Self.otherSize))
+            .foregroundStyle(.white.opacity(0.35))
+            .lineLimit(4)
+            .multilineTextAlignment(.leading)
+            .fixedSize(horizontal: false, vertical: true)
+            .frame(maxWidth: .infinity, alignment: .topLeading)
+    }
+
+    // MARK: Two-line layout
+
+    private var twoLineLines: some View {
+        VStack(alignment: .leading, spacing: 3) {
+            Text(sungText.isEmpty ? " " : sungText)
+                .font(.system(size: Self.sungSize, weight: .semibold))
+                .foregroundStyle(.white)
+                .lineLimit(1)
+                .minimumScaleFactor(Self.sungShrink)
+                .contentTransition(.opacity)
+                .frame(maxWidth: .infinity, alignment: .leading)
+
+            Text(nextText.isEmpty ? " " : nextText)
+                .font(.system(size: Self.nextSize))
+                .foregroundStyle(.white.opacity(0.5))
+                .lineLimit(1)
+                .minimumScaleFactor(Self.nextShrink)
+                .contentTransition(.opacity)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        // Centred rather than top-aligned: the scrolling layout puts its sung line
+        // 15pt down, and a centred block of two rows starts at almost exactly that
+        // height, so switching layouts does not shift the text.
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
+        .animation(.easeInOut(duration: Self.jumpDuration), value: index)
+    }
+
+    private var sungText: String {
+        lines.indices.contains(index) ? lines[index].text : ""
+    }
+
+    private var nextText: String {
+        lines.indices.contains(index + 1) ? lines[index + 1].text : ""
+    }
+
+    // MARK: Scrolling layout
+
+    private func scrollingLines(height: CGFloat) -> some View {
+        let reserved = Self.hasTranslation(lines) ? Self.translationSlot : 0
+        let rows = Self.rowCount(for: height - reserved)
+        let lyricsHeight = CGFloat(rows) * Self.rowHeight
+
+        return VStack(alignment: .leading, spacing: 0) {
+            scrollingRows(rows: rows)
+                .frame(height: lyricsHeight, alignment: .top)
+                // Lines enter and leave through a soft fade rather than a hard
+                // cut, which is what a half-scrolled line needs to not look like
+                // a rendering glitch.
+                .mask(Self.edgeFade)
+            if reserved > 0 {
+                translationLine
+                    .frame(height: max(0, height - lyricsHeight), alignment: .top)
             }
         }
     }
@@ -375,7 +450,7 @@ struct LyricsView: View {
         lines.contains { !($0.translation ?? "").trimmingCharacters(in: .whitespaces).isEmpty }
     }
 
-    private func scrollingLines(rows: Int) -> some View {
+    private func scrollingRows(rows: Int) -> some View {
         let first = index - 1
         // Over one line's duration the stack rises by exactly one row, which
         // lands the next line precisely where the sung one started.
@@ -440,19 +515,35 @@ struct LyricsView: View {
 /// the last now-playing update the redraw is what keeps the scroll smooth.
 struct LyricsPanel: View {
     @ObservedObject var musicManager = MusicManager.shared
+    @Default(.lyricsDisplayMode) private var displayMode
+    @Default(.lyricsLanguage) private var language
 
     var body: some View {
-        TimelineView(.animation(minimumInterval: musicManager.isPlaying ? 0.05 : 1)) {
-            timeline in
+        TimelineView(.animation(minimumInterval: redrawInterval)) { timeline in
             let frame = musicManager.lyricFrame(at: timeline.date)
 
             LyricsView(
-                lines: musicManager.syncedLyrics,
+                lines: musicManager.displayLyrics(mode: displayMode, language: language),
+                mode: displayMode,
                 index: frame?.index ?? 0,
                 progress: frame?.progress ?? 0,
                 placeholder: frame == nil ? placeholderText : nil
             )
         }
+        // Clicking the lyrics steps through Original / Translation / Automatic.
+        // Which text to read is a per-track call people flip often — an
+        // instrumental passage may want the original, a verse they cannot follow
+        // the translation — so it lives on the panel itself rather than only in
+        // Settings. The two-line layout redraws on line changes alone, so it
+        // needs a far lazier clock than the scrolling one.
+        .contentShape(Rectangle())
+        .onTapGesture { language = language.next }
+        .help("Lyrics language: \(language.rawValue) — click to change")
+    }
+
+    private var redrawInterval: Double {
+        guard musicManager.isPlaying else { return 1 }
+        return displayMode == .twoLine ? 0.2 : 0.05
     }
 
     private var placeholderText: String {

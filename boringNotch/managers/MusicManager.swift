@@ -507,6 +507,48 @@ class MusicManager: ObservableObject {
         LRCParser.parse(lrc)
     }
 
+    /// The lyrics as they should be drawn under the current settings.
+    ///
+    /// The language choice decides which text a line *carries*. In the two-line
+    /// layout that is the whole story. The scrolling layout keeps the original on
+    /// the moving rows and uses `translation` for its pinned strip, so only
+    /// `automatic` leaves that field populated.
+    ///
+    /// The result maps `syncedLyrics` one-to-one and in order, so an index from
+    /// `lyricFrame(at:)` stays valid for it.
+    func displayLyrics(mode: LyricsDisplayMode, language: LyricsLanguage) -> [LyricLine] {
+        guard !syncedLyrics.isEmpty else { return [] }
+
+        let hasTranslation = syncedLyrics.contains {
+            !($0.translation ?? "").trimmingCharacters(in: .whitespaces).isEmpty
+        }
+
+        switch language {
+        case .original:
+            return syncedLyrics.map { LyricLine(time: $0.time, text: $0.text) }
+
+        case .translation:
+            return syncedLyrics.map(translated)
+
+        case .automatic:
+            guard hasTranslation else {
+                return syncedLyrics.map { LyricLine(time: $0.time, text: $0.text) }
+            }
+            // Two lines have no room for a second row, so automatic resolves to
+            // the translation there; the scrolling layout shows both.
+            return mode == .twoLine
+                ? syncedLyrics.map(translated)
+                : syncedLyrics
+        }
+    }
+
+    /// A line showing its translation when it has one and its original text
+    /// otherwise, so a partially translated track does not lose lines.
+    private func translated(_ line: LyricLine) -> LyricLine {
+        let translation = (line.translation ?? "").trimmingCharacters(in: .whitespaces)
+        return LyricLine(time: line.time, text: translation.isEmpty ? line.text : translation)
+    }
+
     /// Everything the scrolling panel needs for one frame: which line is being
     /// sung, and how far through that line we are. The fraction is what makes
     /// the lyrics glide instead of stepping once per line.

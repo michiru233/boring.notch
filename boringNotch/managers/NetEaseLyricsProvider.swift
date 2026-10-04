@@ -57,7 +57,7 @@ enum LRCParser {
             let text = nsLine
                 .substring(from: match.range.location + match.range.length)
                 .trimmingCharacters(in: .whitespaces)
-            guard !text.isEmpty else { continue }
+            guard !text.isEmpty, !isMetadata(text) else { continue }
 
             result.append(LyricLine(time: minutes * 60 + seconds + fraction, text: text))
         }
@@ -84,6 +84,48 @@ enum LRCParser {
             return copy
         }
     }
+
+    /// Credit keys NetEase uses to open a track. They are only consulted when the
+    /// line really reads `key : value`, so a lyric that happens to contain a colon
+    /// is left alone.
+    private static let creditKeys: Set<String> = [
+        "作词", "作曲", "编曲", "制作人", "制作", "和声", "和声编写", "配唱", "监制",
+        "吉他", "贝斯", "鼓", "键盘", "弦乐", "口琴", "录音", "录音师", "录音工程师",
+        "混音", "混音师", "母带", "母带工程师", "出品", "出品人", "发行", "策划",
+        "统筹", "企划", "总监制", "词", "曲", "op", "sp",
+        "lyrics", "lyric", "composed", "composer", "arranged", "arranger",
+        "produced", "producer", "mixed", "mastered", "written",
+        "lyrics by", "composed by", "arranged by", "produced by", "mixed by",
+        "mastered by", "written by", "music by",
+    ]
+
+    /// What NetEase puts in the `lrc` field of a release that has no lyrics at
+    /// all. Left in, one of these would be the only thing on screen for the whole
+    /// track.
+    private static let placeholderLines: Set<String> = [
+        "纯音乐，请欣赏", "纯音乐请欣赏", "纯音乐", "纯音乐，请您欣赏",
+        "此歌曲为没有填词的纯音乐，请您欣赏", "该歌曲为纯音乐，请欣赏",
+        "暂无歌词", "暂无歌词，请欣赏",
+    ]
+
+    /// Whether a timed line is credits or a no-lyrics placeholder rather than
+    /// something that gets sung.
+    ///
+    /// NetEase stamps the credits of a track with real timestamps —
+    /// `[00:00.00] 作词 : 米津玄師` — so without this they are handed back as if
+    /// they were lyrics. That put six credit rows in 晴天's opening five seconds,
+    /// and made マリーゴールド open with nothing but credits for 21 seconds.
+    private static func isMetadata(_ text: String) -> Bool {
+        let line = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        if placeholderLines.contains(line) { return true }
+
+        guard let separator = line.firstIndex(where: { $0 == ":" || $0 == "：" })
+        else { return false }
+        let key = line[line.startIndex..<separator]
+            .trimmingCharacters(in: .whitespaces)
+            .lowercased()
+        return !key.isEmpty && key.count <= 12 && creditKeys.contains(key)
+    }
 }
 
 // MARK: - Provider
@@ -99,9 +141,10 @@ actor NetEaseLyricsProvider {
     /// Bundle identifier of the NetEase Cloud Music macOS client.
     static let bundleIdentifier = "com.netease.163music"
 
-    /// Playback duration tolerance used when picking a search candidate. Keeps
-    /// covers, live takes and remixes from winning over the studio version.
-    private static let durationTolerance: Double = 3
+    /// How many ranked candidates a lookup will try before giving up. Normally
+    /// only the first is needed; the rest exist so that a lyric-less take winning
+    /// the duration ranking cannot sink the whole lookup.
+    private static let candidateAttempts = 3
 
     private let searchEndpoint = "https://music.163.com/api/search/get/web"
     private let lyricEndpoint = "https://music.163.com/api/song/lyric"
@@ -109,6 +152,32 @@ actor NetEaseLyricsProvider {
     private var hits: [String: [LyricLine]] = [:]
     private var misses: Set<String> = []
     private let cacheLimit = 200
+
+    // MARK: Outcomes
+
+    /// What one attempt concluded.
+    ///
+    /// The three cases exist because only a real verdict may be cached. NetEase
+    /// answers a burst with HTTP 200 and a body carrying a non-200 `code`
+    /// (406 and 405 were both seen), and storing that refusal as "this track has
+    /// no lyrics" would hide the track for the rest of the session.
+    private enum LookupOutcome {
+        case lyrics([LyricLine])
+        case notFound
+        case transient
+    }
+
+    private enum SearchOutcome {
+        case ranked([Int])
+        case notFound
+        case transient
+    }
+
+    private enum LyricOutcome {
+        case lyrics([LyricLine])
+        case notFound
+        case transient
+    }
 
     private lazy var session: URLSession = {
         let config = URLSessionConfiguration.ephemeral
@@ -138,19 +207,66 @@ actor NetEaseLyricsProvider {
         if let cached = hits[key] { return cached }
         if misses.contains(key) { return nil }
 
-        guard let songID = await searchSongID(title: cleanTitle, artist: artist, duration: duration)
-        else {
+        switch await lookUp(title: cleanTitle, artist: artist, duration: duration) {
+        case .lyrics(let lines):
+            remember(hit: lines, for: key)
+            return lines
+
+        case .notFound:
             remember(miss: key)
             return nil
+
+        case .transient:
+            // Throttling clears within tens of seconds, so one delayed retry
+            // rescues the common case without turning into a backoff loop.
+            try? await Task.sleep(for: .seconds(3))
+            switch await lookUp(title: cleanTitle, artist: artist, duration: duration) {
+            case .lyrics(let lines):
+                remember(hit: lines, for: key)
+                return lines
+            case .notFound:
+                remember(miss: key)
+                return nil
+            case .transient:
+                // Still throttled, so this is not a verdict on the track: leave
+                // it uncached so a later attempt can still succeed, and let the
+                // caller show its fallback in the meantime.
+                return nil
+            }
+        }
+    }
+
+    // MARK: Lookup
+
+    private func lookUp(title: String, artist: String, duration: Double) async -> LookupOutcome {
+        let candidates: [Int]
+        switch await searchCandidates(title: title, artist: artist, duration: duration) {
+        case .transient:
+            return .transient
+        case .notFound:
+            return .notFound
+        case .ranked(let ids):
+            candidates = ids
         }
 
-        guard let lines = await fetchLyrics(songID: songID) else {
-            remember(miss: key)
-            return nil
+        // Walk the ranked candidates rather than betting on the top one. The
+        // closest duration is usually the studio release, but an instrumental or
+        // karaoke take can win on duration alone and then turn out to carry no
+        // lyrics at all — マリーゴールド's instrumental does exactly that, while
+        // two complete releases sat right behind it in the same result set.
+        var throttled = false
+        for songID in candidates {
+            switch await fetchLyrics(songID: songID) {
+            case .lyrics(let lines):
+                return .lyrics(lines)
+            case .notFound:
+                continue
+            case .transient:
+                throttled = true
+                continue
+            }
         }
-
-        remember(hit: lines, for: key)
-        return lines
+        return throttled ? .transient : .notFound
     }
 
     // MARK: Search
@@ -169,7 +285,9 @@ actor NetEaseLyricsProvider {
         let result: Payload?
     }
 
-    private func searchSongID(title: String, artist: String, duration: Double) async -> Int? {
+    private func searchCandidates(
+        title: String, artist: String, duration: Double
+    ) async -> SearchOutcome {
         // Bracketed qualifiers skew NetEase's relevance ranking badly enough to
         // return unrelated tracks — searching "夜曲 (Live) 周杰伦" surfaces ten songs
         // that are not 夜曲 at all — so the query uses the plain title. Matching
@@ -179,53 +297,78 @@ actor NetEaseLyricsProvider {
         let query = artist.isEmpty ? queryTitle : "\(queryTitle) \(artist)"
         guard let encoded = query.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed),
               let url = URL(string: "\(searchEndpoint)?s=\(encoded)&type=1&limit=10")
-        else { return nil }
+        else { return .notFound }
 
-        guard let data = await get(url),
-              let decoded = try? JSONDecoder().decode(SearchResult.self, from: data),
+        // A transport failure is not a verdict on the track either, so it is
+        // reported as transient rather than cached away.
+        guard let data = await get(url) else { return .transient }
+        if isThrottled(data) { return .transient }
+
+        guard let decoded = try? JSONDecoder().decode(SearchResult.self, from: data),
               let songs = decoded.result?.songs,
               !songs.isEmpty
-        else { return nil }
+        else { return .notFound }
 
-        return pick(from: songs, title: title, artist: artist, duration: duration)
+        return .ranked(rank(songs, title: title, artist: artist, duration: duration))
     }
 
-    /// Chooses among search candidates.
+    /// Words NetEase uses to label a release that has no vocals to show lyrics
+    /// for. Such a take shares the studio release's duration, so it ranks well
+    /// while being guaranteed to come back empty.
+    private static let instrumentalMarkers = [
+        "instrumental", "off vocal", "offvocal", "off-vocal", "karaoke",
+        "inst.", "(inst", "カラオケ", "オフボーカル", "伴奏", "纯音乐", "純音樂",
+        "无人声", "無人声", "無人聲", "无人聲",
+    ]
+
+    private func isInstrumental(_ name: String) -> Bool {
+        let lowered = name.lowercased()
+        return Self.instrumentalMarkers.contains { lowered.contains($0) }
+    }
+
+    /// Orders the search results from most to least likely to be the track that
+    /// is playing.
     ///
     /// NetEase search ranks by its own relevance and returns unrelated tracks —
     /// searching "夜曲 周杰伦" turns up covers plus 刀马旦, a different song that
     /// happens to feature the same artist. So candidates are first restricted to
     /// those whose title matches what is playing; only then does an artist match
-    /// win, and only then does the closest duration decide. Returning nil (and
-    /// letting the caller fall back to another source) beats showing the lyrics
-    /// of a different song.
-    private func pick(
-        from songs: [SearchResult.Payload.Song], title: String, artist: String,
+    /// win, and only then does the closest duration decide. The full ordering is
+    /// returned rather than a single winner, so the caller can move on if the
+    /// best candidate turns out to have nothing to show.
+    private func rank(
+        _ songs: [SearchResult.Payload.Song], title: String, artist: String,
         duration: Double
-    ) -> Int? {
+    ) -> [Int] {
         let normalizedTitle = normalizeTitle(title)
         let titleMatched = songs.filter { titleMatches($0.name, normalizedTitle) }
-        guard !titleMatched.isEmpty else { return nil }
+        guard !titleMatched.isEmpty else { return [] }
 
-        var pool = titleMatched
+        let singable = titleMatched.filter { !isInstrumental($0.name) }
+        var pool = singable.isEmpty ? titleMatched : singable
+
         let wanted = normalize(artist)
         if !wanted.isEmpty {
-            let matched = titleMatched.filter { song in
+            let matched = pool.filter { song in
                 (song.artists ?? []).contains { normalize($0.name) == wanted }
             }
             if !matched.isEmpty { pool = matched }
         }
 
-        guard duration > 0 else { return pool.first?.id }
+        guard duration > 0 else { return Array(pool.map(\.id).prefix(Self.candidateAttempts)) }
 
-        // NetEase reports durations in milliseconds.
-        let ranked = pool.compactMap { song -> (id: Int, delta: Double)? in
-            guard let ms = song.duration, ms > 0 else { return nil }
-            return (song.id, abs(ms / 1000 - duration))
-        }
-        guard let best = ranked.min(by: { $0.delta < $1.delta }) else { return pool.first?.id }
+        // NetEase reports durations in milliseconds. Candidates that report no
+        // duration keep their relative order at the back.
+        let byDistance = pool
+            .compactMap { song -> (id: Int, delta: Double)? in
+                guard let ms = song.duration, ms > 0 else { return nil }
+                return (song.id, abs(ms / 1000 - duration))
+            }
+            .sorted { $0.delta < $1.delta }
+            .map(\.id)
 
-        return best.id
+        let leftovers = pool.map(\.id).filter { !byDistance.contains($0) }
+        return Array((byDistance + leftovers).prefix(Self.candidateAttempts))
     }
 
     // MARK: Lyrics
@@ -236,23 +379,44 @@ actor NetEaseLyricsProvider {
         let tlyric: Track?
     }
 
-    private func fetchLyrics(songID: Int) async -> [LyricLine]? {
+    private func fetchLyrics(songID: Int) async -> LyricOutcome {
         guard let url = URL(string: "\(lyricEndpoint)?id=\(songID)&lv=-1&kv=-1&tv=-1"),
-              let data = await get(url),
-              let decoded = try? JSONDecoder().decode(LyricResponse.self, from: data),
+              let data = await get(url)
+        else { return .transient }
+
+        if isThrottled(data) { return .transient }
+
+        guard let decoded = try? JSONDecoder().decode(LyricResponse.self, from: data),
               let raw = decoded.lrc?.lyric
-        else { return nil }
+        else { return .notFound }
 
         let lines = LRCParser.parse(raw)
-        guard !lines.isEmpty else { return nil }
+        guard !lines.isEmpty else { return .notFound }
 
         guard let translationRaw = decoded.tlyric?.lyric, !translationRaw.isEmpty else {
-            return lines
+            return .lyrics(lines)
         }
-        return LRCParser.merge(translation: LRCParser.parse(translationRaw), into: lines)
+        return .lyrics(LRCParser.merge(translation: LRCParser.parse(translationRaw), into: lines))
     }
 
     // MARK: Networking
+
+    /// NetEase answers a burst of lookups with HTTP 200 and a body of
+    /// `{"msg":"操作频繁，请稍候再试","code":406}` — a success status carrying a
+    /// refusal. The `code` is not stable (405 was seen too), so any non-200 value
+    /// counts. How long it lasts scales with the burst: a short one cleared in
+    /// about 20 seconds, while 30 rapid requests earned a block still in force
+    /// ten minutes later. Read as an ordinary empty result it would be cached as
+    /// "this track has no lyrics", which is how one transient block used to hide
+    /// a track for the rest of the session.
+    private struct ErrorEnvelope: Decodable { let code: Int? }
+
+    private func isThrottled(_ data: Data) -> Bool {
+        guard let envelope = try? JSONDecoder().decode(ErrorEnvelope.self, from: data),
+              let code = envelope.code
+        else { return false }
+        return code != 200
+    }
 
     private func get(_ url: URL) async -> Data? {
         do {

@@ -600,6 +600,8 @@ struct Media: View {
     @Default(.sneakPeekStyles) var sneakPeekStyles
 
     @Default(.enableLyrics) var enableLyrics
+    @Default(.lyricsDisplayMode) var lyricsDisplayMode
+    @Default(.lyricsLanguage) var lyricsLanguage
 
     var body: some View {
         Form {
@@ -683,6 +685,18 @@ struct Media: View {
                     HStack {
                         Text("Show lyrics in the player")
                         customBadge(text: "Beta")
+                    }
+                }
+                if enableLyrics {
+                    Picker("Lyrics layout", selection: $lyricsDisplayMode) {
+                        ForEach(LyricsDisplayMode.allCases) { mode in
+                            Text(mode.rawValue).tag(mode)
+                        }
+                    }
+                    Picker("Lyrics language", selection: $lyricsLanguage) {
+                        ForEach(LyricsLanguage.allCases) { language in
+                            Text(language.rawValue).tag(language)
+                        }
                     }
                 }
             } header: {
