@@ -21,8 +21,11 @@ struct DynamicNotchApp: App {
     let updaterController: SPUStandardUpdaterController
 
     init() {
+        // This fork is not wired to the upstream appcast, so the updater is never
+        // started: a failed start would raise Sparkle's fatal-error alert at
+        // launch, and the upstream feed would overwrite the custom build.
         updaterController = SPUStandardUpdaterController(
-            startingUpdater: true, updaterDelegate: nil, userDriverDelegate: nil)
+            startingUpdater: false, updaterDelegate: nil, userDriverDelegate: nil)
 
         // Initialize the settings window controller with the updater controller
         SettingsWindowController.shared.setUpdaterController(updaterController)

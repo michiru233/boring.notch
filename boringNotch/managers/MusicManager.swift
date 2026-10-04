@@ -20,6 +20,7 @@ class MusicManager: ObservableObject {
     private var cancellables = Set<AnyCancellable>()
     private var controllerCancellables = Set<AnyCancellable>()
     private var debounceIdleTask: Task<Void, Never>?
+    private var lyricsLookupTask: Task<Void, Never>?
 
     // Helper to check if macOS has removed support for NowPlayingController
     public private(set) var isNowPlayingDeprecated: Bool = false
@@ -50,7 +51,7 @@ class MusicManager: ObservableObject {
     @Published var usingAppIconForArtwork: Bool = false
     @Published var currentLyrics: String = ""
     @Published var isFetchingLyrics: Bool = false
-    @Published var syncedLyrics: [(time: Double, text: String)] = []
+    @Published var syncedLyrics: [LyricLine] = []
     @Published var canFavoriteTrack: Bool = false
     @Published var isFavoriteTrack: Bool = false
 
@@ -98,6 +99,7 @@ class MusicManager: ObservableObject {
     
     public func destroy() {
         debounceIdleTask?.cancel()
+        lyricsLookupTask?.cancel()
         cancellables.removeAll()
         controllerCancellables.removeAll()
         flipWorkItem?.cancel()
@@ -343,10 +345,22 @@ class MusicManager: ObservableObject {
     // MARK: - Lyrics
     private func fetchLyricsIfAvailable(bundleIdentifier: String?, title: String, artist: String) {
         guard Defaults[.enableLyrics], !title.isEmpty else {
+            lyricsLookupTask?.cancel()
             DispatchQueue.main.async {
                 self.isFetchingLyrics = false
                 self.currentLyrics = ""
             }
+            return
+        }
+
+        // A lookup started for the previous track must never land on this one.
+        lyricsLookupTask?.cancel()
+
+        // NetEase Cloud Music ships no AppleScript dictionary and its sandboxed
+        // lyric cache is unreachable, so its lyrics come from NetEase's own
+        // endpoints instead of the generic web lookup.
+        if bundleIdentifier == NetEaseLyricsProvider.bundleIdentifier {
+            fetchLyricsFromNetEase(title: title, artist: artist)
             return
         }
 
@@ -401,6 +415,34 @@ class MusicManager: ObservableObject {
                 self.currentLyrics = ""
                 await self.fetchLyricsFromWeb(title: title, artist: artist)
             }
+        }
+    }
+
+    /// Looks lyrics up on NetEase Cloud Music, falling back to the generic web
+    /// source when NetEase has nothing (or the lookup fails outright).
+    private func fetchLyricsFromNetEase(title: String, artist: String) {
+        lyricsLookupTask = Task { @MainActor in
+            self.isFetchingLyrics = true
+            self.currentLyrics = ""
+            self.syncedLyrics = []
+
+            // Let the now-playing payload settle so the duration we match against
+            // belongs to the track being looked up, not the previous one.
+            try? await Task.sleep(for: .milliseconds(300))
+            guard !Task.isCancelled else { return }
+
+            let lines = await NetEaseLyricsProvider.shared.lyrics(
+                title: title, artist: artist, duration: self.songDuration)
+            guard !Task.isCancelled else { return }
+
+            if let lines {
+                self.syncedLyrics = lines
+                self.currentLyrics = lines.map(\.text).joined(separator: "\n")
+                self.isFetchingLyrics = false
+                return
+            }
+
+            await self.fetchLyricsFromWeb(title: title, artist: artist)
         }
     }
 
@@ -461,49 +503,50 @@ class MusicManager: ObservableObject {
     }
 
     // MARK: - Synced lyrics helpers
-    private func parseLRC(_ lrc: String) -> [(time: Double, text: String)] {
-        var result: [(Double, String)] = []
-        lrc.split(separator: "\n").forEach { lineSub in
-            let line = String(lineSub)
-            // Match [mm:ss.xx] or [m:ss]
-            let pattern = #"\[(\d{1,2}):(\d{2})(?:\.(\d{1,2}))?\]"#
-            guard let regex = try? NSRegularExpression(pattern: pattern) else { return }
-            let nsLine = line as NSString
-            if let match = regex.firstMatch(in: line, range: NSRange(location: 0, length: nsLine.length)) {
-                let minStr = nsLine.substring(with: match.range(at: 1))
-                let secStr = nsLine.substring(with: match.range(at: 2))
-                let csRange = match.range(at: 3)
-                let centiStr = csRange.location != NSNotFound ? nsLine.substring(with: csRange) : "0"
-                let minutes = Double(minStr) ?? 0
-                let seconds = Double(secStr) ?? 0
-                let centis = Double(centiStr) ?? 0
-                let time = minutes * 60 + seconds + centis / 100.0
-                let textStart = match.range.location + match.range.length
-                let text = nsLine.substring(from: textStart).trimmingCharacters(in: .whitespaces)
-                if !text.isEmpty {
-                    result.append((time, text))
-                }
-            }
-        }
-        return result.sorted { $0.0 < $1.0 }
+    private func parseLRC(_ lrc: String) -> [LyricLine] {
+        LRCParser.parse(lrc)
     }
 
-    func lyricLine(at elapsed: Double) -> String {
-        guard !syncedLyrics.isEmpty else { return currentLyrics }
-        // Binary search for last line with time <= elapsed
+    /// The line to show for a playback position, plus its neighbours, so the
+    /// player can render a scrolling window instead of a single line.
+    struct LyricWindow: Equatable {
+        var previous: String?
+        var current: String
+        var translation: String?
+        var next: String?
+    }
+
+    func lyricWindow(at elapsed: Double) -> LyricWindow? {
+        guard !syncedLyrics.isEmpty else { return nil }
+        let index = indexOfLine(at: elapsed)
+        return LyricWindow(
+            previous: index > 0 ? syncedLyrics[index - 1].text : nil,
+            current: syncedLyrics[index].text,
+            translation: syncedLyrics[index].translation,
+            next: index + 1 < syncedLyrics.count ? syncedLyrics[index + 1].text : nil
+        )
+    }
+
+    /// Index of the last line whose timestamp is at or before `elapsed`.
+    private func indexOfLine(at elapsed: Double) -> Int {
         var low = 0
         var high = syncedLyrics.count - 1
-        var idx = 0
+        var index = 0
         while low <= high {
             let mid = (low + high) / 2
             if syncedLyrics[mid].time <= elapsed {
-                idx = mid
+                index = mid
                 low = mid + 1
             } else {
                 high = mid - 1
             }
         }
-        return syncedLyrics[idx].text
+        return index
+    }
+
+    func lyricLine(at elapsed: Double) -> String {
+        guard !syncedLyrics.isEmpty else { return currentLyrics }
+        return syncedLyrics[indexOfLine(at: elapsed)].text
     }
 
     private func triggerFlipAnimation() {
